@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pokemon Tracker PRO Cloud</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+</head>
+<body class="bg-gray-100 p-6 text-gray-800">
+  <div class="max-w-7xl mx-auto">
+    <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4 mb-6">
+      <div>
+        <h1 class="text-3xl font-bold">Pokemon Tracker PRO Cloud</h1>
+        <p class="text-sm text-gray-500">Versione online con Supabase, ricerca stabile e salvataggio su più dispositivi</p>
+      </div>
+      <div id="auth" class="bg-white rounded-2xl shadow p-4 w-full lg:w-[560px] min-h-[150px]"></div>
+    </div>
+
+    <div class="bg-blue-50 border border-blue-200 rounded-2xl p-4 mb-5 text-sm text-blue-900">
+      <strong>Cloud attivo:</strong> questa versione salva le carte su Supabase e permette di ritrovarle anche da altri dispositivi dopo il login.
+    </div>
+
+    <div class="relative mb-4">
+      <input id="search" placeholder="Cerca nome, numero o codice (es: Pikachu, 25, PFL 003, PFL 003/119, base1-4)" class="p-3 border rounded-xl w-full" />
+      <div id="suggestions" class="absolute left-0 right-0 bg-white border border-gray-200 rounded-xl mt-1 shadow-lg z-20 overflow-hidden"></div>
+    </div>
+
+    <div id="status" class="text-sm text-gray-500 mb-4"></div>
+
+    <div id="results" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"></div>
+
+    <div class="mt-4">
+      <button id="loadMoreBtn" class="hidden bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg">Carica altri</button>
+    </div>
+
+    <h2 class="text-2xl font-semibold mt-8 mb-3">Collezione</h2>
+    <div id="collectionSummary" class="mb-4 text-lg font-semibold"></div>
+    <div id="collection" class="space-y-8"></div>
+  </div>
+
+  <script>
+    const SUPABASE_URL = 'https://awmcaxhbmscxefroovff.supabase.co';
+    const SUPABASE_KEY = 'sb_publishable_23gf50BWtn-G7LxlAYq7-g_iSE4kWna';
+
+    const authBox = document.getElementById('auth');
+    const searchInput = document.getElementById('search');
+    const suggestionsBox = document.getElementById('suggestions');
+    const resultsBox = document.getElementById('results');
+    const collectionBox = document.getElementById('collection');
+    const collectionSummary = document.getElementById('collectionSummary');
+    const statusBox = document.getElementById('status');
+    const loadMoreBtn = document.getElementById('loadMoreBtn');
+
+    const languages = ['Italiano', 'English', 'Japanese', 'French', 'German', 'Spanish'];
+    const conditions = ['NM', 'EX', 'GD', 'LP', 'PL', 'PO'];
+    const finishes = ['Normale', 'Reverse'];
+
+    const languageMultipliers = { Italiano: 1.02, English: 1.0, Japanese: 1.12, French: 0.96, German: 0.98, Spanish: 0.95 };
+    const conditionMultipliers = { NM: 1.0, EX: 0.9, GD: 0.75, LP: 0.82, PL: 0.6, PO: 0.4 };
+    const finishMultipliers = { Normale: 1.0, Reverse: 1.15 };
+
+    let supabase = null;
+    let currentUser = null;
+    let collection = [];
+    let debounceTimer = null;
+    let lastSuggestionController = null;
+    let lastSearchController = null;
+    let currentSearchQuery = '';
+    let currentPage = 1;
+    let hasMoreResults = false;
+
+    function escapeHtml(text) {
+      return String(text || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    function normalizeQuery(v) {
+      return String(v || '').trim().replace(/\s+/g, ' ');
+    }
+
+    function showStatus(msg, isError = false) {
+      statusBox.textContent = msg || '';
+      statusBox.className = isError ? 'text-sm text-red-600 mb-4' : 'text-sm text-gray-500 mb-4';
+    }
+
+    function setAuthMessage(msg, isError = false) {
+      const el = document.getElementById('authMessage');
+      if (!el) return;
+      el.textContent = msg;
+      el.className = isError ? 'text-sm mt-3 text-red-600' : 'text-sm mt-3 text-green-600';
+    }
+
+    function renderAuth(message = '', isError = false) {
+      if (!supabase) {
+        authBox.innerHTML = `
+          <div class="text-red-600 text-sm">
+            Impossibile inizializzare Supabase. Apri questo file con connessione internet attiva.
+          </div>
+        `;
+        return;
+      }
+
+      if (currentUser?.email) {
+        authBox.innerHTML = `
+          <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div>
+              <div class="font-semibold">Account: ${escapeHtml(currentUser.email)}</div>
+              <div class="text-sm text-gray-500">Salvataggio cloud attivo su Supabase</div>
+            </div>
+            <button id="logoutBtn" class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg">Logout</button>
+          </div>
+        `;
+        document.getElementById('logoutBtn').onclick = logoutUser;
+        return;
+      }
+
+      authBox.innerHTML = `
+        <div class="grid md:grid-cols-2 gap-4">
+          <div>
+            <div class="font-semibold mb-2">Crea account</div>
+            <input id="registerEmail" type="email" placeholder="Email" class="w-full border rounded p-2 mb-2" />
+            <input id="registerPass" type="password" placeholder="Password" class="w-full border rounded p-2 mb-2" />
+            <button id="registerBtn" class="w-full bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-lg">Registrati</button>
+          </div>
+          <div>
+            <div class="font-semibold mb-2">Login</div>
+            <input id="loginEmail" type="email" placeholder="Email" class="w-full border rounded p-2 mb-2" />
+            <input id="loginPass" type="password" placeholder="Password" class="w-full border rounded p-2 mb-2" />
+            <button id="loginBtn" class="w-full bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg">Entra</button>
+          </div>
+        </div>
+        <div id="authMessage" class="text-sm mt-3 ${isError ? 'text-red-600' : 'text-green-600'}">${escapeHtml(message)}</div>
+      `;
+      document.getElementById('registerBtn').onclick = registerUser;
+      document.getElementById('loginBtn').onclick = loginUser;
+    }
+
+    async function registerUser() {
+      const email = document.getElementById('registerEmail').value.trim();
+      const password = document.getElementById('registerPass').value.trim();
+      if (!email || !password) {
+        setAuthMessage('Inserisci email e password.', true);
+        return;
+      }
+      const { error } = await supabase.auth.signUp({ email, password });
+      if (error) {
+        setAuthMessage(error.message, true);
+        return;
+      }
+      renderAuth('Account creato. Se serve, conferma l’email e poi fai login.');
+    }
+
+    async function loginUser() {
+      const email = document.getElementById('loginEmail').value.trim();
+      const password = document.getElementById('loginPass').value.trim();
+      if (!email || !password) {
+        setAuthMessage('Inserisci email e password.', true);
+        return;
+      }
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) {
+        setAuthMessage(error.message, true);
+        return;
+      }
+      currentUser = data.user;
+      renderAuth();
+      await loadCollection();
+    }
+
+    async function logoutUser() {
+      await supabase.auth.signOut();
+      currentUser = null;
+      collection = [];
+      renderAuth();
+      renderCollection();
+    }
+
+    function getCardPrice(card, language = 'English', condition = 'NM', finish = 'Normale') {
+      const p = card?.cardmarket?.prices || {};
+      const t = card?.tcgplayer?.prices || {};
+
+      let base = null;
+      if (finish === 'Reverse') {
+        base = p.reverseHoloSell ?? p.reverseHoloLow ?? p.reverseHoloTrend ?? p.reverseHoloAvg7 ?? p.reverseHoloAvg30 ?? t.reverseHolofoil?.market ?? null;
+      } else {
+        base = p.averageSellPrice ?? p.lowPriceExPlus ?? p.trendPrice ?? p.avg7 ?? p.avg30 ?? p.lowPrice ?? t.normal?.market ?? t.holofoil?.market ?? null;
+      }
+
+      if (base == null) {
+        base = p.averageSellPrice ?? p.trendPrice ?? p.lowPrice ?? t.normal?.market ?? t.holofoil?.market ?? 0.01;
+        base = base * (finishMultipliers[finish] || 1);
+      }
+
+      return Number((base * (languageMultipliers[language] || 1) * (conditionMultipliers[condition] || 1)).toFixed(2));
+    }
+
+    function dedupeCards(cards) {
+      const seen = new Set();
+      return cards.filter(card => {
+        if (!card?.id || seen.has(card.id)) return false;
+        seen.add(card.id);
+        return true;
+      });
+    }
+
+    function parsePrefixedCode(query) {
+      const q = normalizeQuery(query).toUpperCase();
+      const match = q.match(/^([A-Z]{2,6})[\s\-_/]+(\d{1,3})(?:\/(\d{1,3}))?$/);
+      if (!match) return null;
+      const prefix = match[1];
+      const rawNumber = match[2];
+      return { prefix, rawNumber, padded: rawNumber.padStart(3, '0'), unpadded: String(parseInt(rawNumber, 10)) };
+    }
+
+    function buildQueries(query, isSuggestions = false) {
+      const q = normalizeQuery(query);
+      const queries = [];
+      const prefixed = parsePrefixedCode(q);
+
+      if (prefixed) {
+        queries.push(`set.ptcgoCode:${prefixed.prefix} number:${prefixed.unpadded}`);
+        queries.push(`set.ptcgoCode:${prefixed.prefix} number:${prefixed.rawNumber}`);
+        queries.push(`set.ptcgoCode:${prefixed.prefix} number:${prefixed.padded}`);
+        queries.push(`id:${prefixed.prefix.toLowerCase()}-${prefixed.unpadded}`);
+        queries.push(`id:${prefixed.prefix.toLowerCase()}-${prefixed.rawNumber}`);
+        queries.push(`id:${prefixed.prefix.toLowerCase()}-${prefixed.padded}`);
+        return [...new Set(queries)];
+      }
+
+      const directId = q.toLowerCase().match(/^([a-z0-9]+)-(\d+[a-z]?)$/i);
+      if (directId) {
+        queries.push(`id:${directId[1]}-${directId[2]}`);
+        queries.push(`set.id:${directId[1]} number:${directId[2]}`);
+        return [...new Set(queries)];
+      }
+
+      if (/^\d+[a-z]?$/i.test(q)) return [`number:${q}`];
+
+      const parts = q.split(' ').filter(Boolean);
+      const maybeSetId = parts.find(p => /^[a-z]+\d+$/i.test(p));
+      const maybeNumber = parts.find(p => /^\d+[a-z]?$/i.test(p));
+      const nameText = parts.filter(p => p !== maybeSetId && p !== maybeNumber).join(' ');
+
+      if (nameText && maybeSetId && maybeNumber) queries.push(`name:"${nameText}" set.id:${maybeSetId.toLowerCase()} number:${maybeNumber}`);
+      if (maybeSetId && maybeNumber) queries.push(`set.id:${maybeSetId.toLowerCase()} number:${maybeNumber}`);
+      if (nameText && maybeNumber) queries.push(`name:"${nameText}" number:${maybeNumber}`);
+      if (nameText && maybeSetId) queries.push(`name:"${nameText}" set.id:${maybeSetId.toLowerCase()}`);
+      if (nameText) {
+        queries.push(`name:"${nameText}"`);
+        const firstWord = nameText.split(' ')[0];
+        if (firstWord) queries.push(`name:${firstWord}*`);
+      }
+      if (!nameText && q) {
+        const firstWord = q.split(' ')[0];
+        if (firstWord) queries.push(`name:${firstWord}*`);
+      }
+      if (isSuggestions && nameText) {
+        const firstWord = nameText.split(' ')[0];
+        if (firstWord) queries.unshift(`name:${firstWord}*`);
+      }
+      return [...new Set(queries)].filter(Boolean);
+    }
+
+    async function fetchCards(query, signal, isSuggestions = false, page = 1) {
+      const pageSize = isSuggestions ? 6 : 20;
+      const candidates = buildQueries(query, isSuggestions);
+      const results = [];
+      hasMoreResults = false;
+
+      for (const candidate of candidates) {
+        const url = `https://api.pokemontcg.io/v2/cards?q=${encodeURIComponent(candidate)}&pageSize=${pageSize}&page=${page}`;
+        const res = await fetch(url, { signal });
+        if (!res.ok) continue;
+        const data = await res.json();
+        if (Array.isArray(data.data) && data.data.length) {
+          results.push(...data.data);
+          if (!isSuggestions && data.data.length === pageSize) hasMoreResults = true;
+        }
+        if (results.length >= pageSize) break;
+      }
+      return dedupeCards(results).slice(0, pageSize);
+    }
+
+    function renderSuggestions(cards) {
+      suggestionsBox.innerHTML = '';
+      if (!cards.length) return;
+      const frag = document.createDocumentFragment();
+      cards.forEach(card => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'w-full flex items-center gap-3 p-3 hover:bg-gray-100 text-left border-b last:border-b-0';
+        btn.innerHTML = `
+          <img loading="lazy" src="${escapeHtml(card.images.small)}" alt="${escapeHtml(card.name)}" class="w-10 h-14 object-contain">
+          <div>
+            <div class="font-medium text-sm">${escapeHtml(card.name)}</div>
+            <div class="text-xs text-gray-500">${escapeHtml(card.set?.name || '')} • ${escapeHtml(card.id)} • #${escapeHtml(card.number)}</div>
+          </div>
+        `;
+        btn.onclick = () => {
+          searchInput.value = card.id;
+          suggestionsBox.innerHTML = '';
+          startSearch();
+        };
+        frag.appendChild(btn);
+      });
+      suggestionsBox.appendChild(frag);
+    }
+
+    async function handleSuggestions() {
+      const query = normalizeQuery(searchInput.value);
+      if (query.length < 2) {
+        suggestionsBox.innerHTML = '';
+        return;
+      }
+      if (lastSuggestionController) lastSuggestionController.abort();
+      lastSuggestionController = new AbortController();
+      try {
+        const cards = await fetchCards(query, lastSuggestionController.signal, true, 1);
+        renderSuggestions(cards);
+      } catch (e) {
+        if (e.name !== 'AbortError') suggestionsBox.innerHTML = '';
+      }
+    }
+
+    async function startSearch() {
+      const query = normalizeQuery(searchInput.value);
+      if (query.length < 2) {
+        resultsBox.innerHTML = '';
+        loadMoreBtn.classList.add('hidden');
+        showStatus('');
+        return;
+      }
+      currentSearchQuery = query;
+      currentPage = 1;
+      resultsBox.innerHTML = '';
+      await loadMoreResults(false);
+    }
+
+    async function loadMoreResults(append = true) {
+      if (!currentSearchQuery) return;
+      if (lastSearchController) lastSearchController.abort();
+      lastSearchController = new AbortController();
+
+      showStatus('Ricerca in corso...');
+      try {
+        const cards = await fetchCards(currentSearchQuery, lastSearchController.signal, false, currentPage);
+        if (!append) resultsBox.innerHTML = '';
+        renderResults(cards, append);
+        const loadedCount = resultsBox.querySelectorAll('.result-card').length;
+        showStatus(cards.length ? `${loadedCount} risultati caricati` : 'Nessuna carta trovata');
+        currentPage += 1;
+        if (hasMoreResults && cards.length) loadMoreBtn.classList.remove('hidden');
+        else loadMoreBtn.classList.add('hidden');
+      } catch (e) {
+        if (e.name !== 'AbortError') {
+          console.error(e);
+          showStatus('Errore durante la ricerca', true);
+        }
+      }
+    }
+
+    function renderResults(cards, append = false) {
+      if (!append) resultsBox.innerHTML = '';
+      if (!cards.length && !append) {
+        resultsBox.innerHTML = '<div class="text-gray-500">Nessuna carta trovata</div>';
+        return;
+      }
+
+      const frag = document.createDocumentFragment();
+      cards.forEach(card => {
+        const price = getCardPrice(card);
+        const div = document.createElement('div');
+        div.className = 'result-card bg-white p-3 rounded-2xl shadow';
+        div.innerHTML = `
+          <img src="${escapeHtml(card.images.small)}" alt="${escapeHtml(card.name)}" class="w-full h-64 object-contain mb-3">
+          <div class="font-semibold">${escapeHtml(card.name)}</div>
+          <div class="text-sm text-gray-500">${escapeHtml(card.set?.name || '')}</div>
+          <div class="text-sm text-gray-500">${escapeHtml(card.id)} • #${escapeHtml(card.number)}</div>
+          <div class="text-sm text-green-600 font-semibold mt-1 price-label">€ ${Number(price).toFixed(2)}</div>
+          <div class="grid grid-cols-1 gap-2 mt-3">
+            <select class="langSelect w-full border rounded p-2 text-sm">${languages.map(v => `<option>${v}</option>`).join('')}</select>
+            <select class="condSelect w-full border rounded p-2 text-sm">${conditions.map(v => `<option>${v}</option>`).join('')}</select>
+            <select class="finishSelect w-full border rounded p-2 text-sm">${finishes.map(v => `<option>${v}</option>`).join('')}</select>
+          </div>
+          <button class="addBtn mt-3 w-full bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-lg">Aggiungi</button>
+        `;
+
+        const langSelect = div.querySelector('.langSelect');
+        const condSelect = div.querySelector('.condSelect');
+        const finishSelect = div.querySelector('.finishSelect');
+        const priceDiv = div.querySelector('.price-label');
+
+        function refreshPrice() {
+          priceDiv.textContent = `€ ${getCardPrice(card, langSelect.value, condSelect.value, finishSelect.value).toFixed(2)}`;
+        }
+        langSelect.onchange = refreshPrice;
+        condSelect.onchange = refreshPrice;
+        finishSelect.onchange = refreshPrice;
+
+        div.querySelector('.addBtn').onclick = async () => {
+          if (!currentUser?.id) {
+            renderAuth('Devi fare login prima di aggiungere una carta.', true);
+            return;
+          }
+          const entry = {
+            user_id: currentUser.id,
+            card_id: card.id,
+            language: langSelect.value,
+            condition: condSelect.value,
+            finish: finishSelect.value,
+            price: getCardPrice(card, langSelect.value, condSelect.value, finishSelect.value),
+            price_label: 'Auto',
+            card_data: card
+          };
+          const { error } = await supabase.from('cards').insert(entry);
+          if (error) {
+            console.error(error);
+            alert('Errore nel salvataggio cloud della carta.');
+            return;
+          }
+          await loadCollection();
+        };
+
+        frag.appendChild(div);
+      });
+      resultsBox.appendChild(frag);
+    }
+
+    async function loadCollection() {
+      if (!currentUser?.id) {
+        collection = [];
+        renderCollection();
+        return;
+      }
+      const { data, error } = await supabase
+        .from('cards')
+        .select('*')
+        .eq('user_id', currentUser.id)
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error(error);
+        collection = [];
+        renderCollection();
+        return;
+      }
+
+      collection = data || [];
+      renderCollection();
+    }
+
+    function renderCollection() {
+      collectionBox.innerHTML = '';
+      if (!currentUser?.email) {
+        collectionSummary.textContent = 'Accedi per salvare e sincronizzare la collezione.';
+        collectionBox.innerHTML = '<div class="text-gray-500">Nessun account cloud attivo.</div>';
+        return;
+      }
+      if (!collection.length) {
+        collectionSummary.textContent = 'Totale complessivo: € 0.00 • Carte salvate: 0';
+        collectionBox.innerHTML = '<div class="text-gray-500">La collezione è vuota.</div>';
+        return;
+      }
+
+      const groups = {};
+      collection.forEach(entry => {
+        const expansion = entry.card_data?.set?.name || 'Espansione sconosciuta';
+        if (!groups[expansion]) groups[expansion] = [];
+        groups[expansion].push(entry);
+      });
+
+      let grandTotal = 0;
+      let totalCards = 0;
+      const expansions = Object.keys(groups).sort((a, b) => a.localeCompare(b, 'it'));
+
+      expansions.forEach(expansion => {
+        const entries = groups[expansion];
+        let expansionTotal = 0;
+        totalCards += entries.length;
+
+        const section = document.createElement('section');
+        section.className = 'bg-white border rounded-2xl p-4 shadow-sm';
+
+        const header = document.createElement('div');
+        header.className = 'flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-4';
+        header.innerHTML = `
+          <div>
+            <h3 class="text-xl font-bold">${escapeHtml(expansion)}</h3>
+            <p class="text-sm text-gray-500">Carte: ${entries.length}</p>
+          </div>
+          <div class="text-lg font-semibold text-green-600"></div>
+        `;
+
+        const grid = document.createElement('div');
+        grid.className = 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4';
+
+        entries.forEach(entry => {
+          const livePrice = getCardPrice(entry.card_data, entry.language, entry.condition, entry.finish);
+          expansionTotal += livePrice;
+          grandTotal += livePrice;
+
+          const cardBox = document.createElement('div');
+          cardBox.className = 'bg-gray-50 p-3 rounded-2xl border';
+          cardBox.innerHTML = `
+            <img src="${escapeHtml(entry.card_data.images.small)}" alt="${escapeHtml(entry.card_data.name)}" class="w-full h-64 object-contain mb-3">
+            <div class="font-semibold">${escapeHtml(entry.card_data.name)}</div>
+            <div class="text-sm text-gray-500">${escapeHtml(entry.card_data.id)} • #${escapeHtml(entry.card_data.number)}</div>
+            <div class="text-xs mt-1">Lingua: <span class="font-medium">${escapeHtml(entry.language)}</span></div>
+            <div class="text-xs">Condizione: <span class="font-medium">${escapeHtml(entry.condition)}</span></div>
+            <div class="text-xs">Versione: <span class="font-medium">${escapeHtml(entry.finish)}</span></div>
+            <div class="text-sm text-green-600 font-semibold mt-2">€ ${livePrice.toFixed(2)}</div>
+            <button class="removeBtn mt-3 w-full bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg">Rimuovi</button>
+          `;
+          cardBox.querySelector('.removeBtn').onclick = async () => {
+            const { error } = await supabase.from('cards').delete().eq('id', entry.id).eq('user_id', currentUser.id);
+            if (error) {
+              console.error(error);
+              return;
+            }
+            await loadCollection();
+          };
+          grid.appendChild(cardBox);
+        });
+
+        header.querySelector('.text-green-600').textContent = `Totale espansione: € ${expansionTotal.toFixed(2)}`;
+        section.appendChild(header);
+        section.appendChild(grid);
+        collectionBox.appendChild(section);
+      });
+
+      collectionSummary.textContent = `Totale complessivo: € ${grandTotal.toFixed(2)} • Carte salvate: ${totalCards} • Espansioni: ${expansions.length}`;
+    }
+
+    searchInput.addEventListener('input', () => {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        handleSuggestions();
+        startSearch();
+      }, 250);
+    });
+
+    document.addEventListener('click', (e) => {
+      if (!suggestionsBox.contains(e.target) && e.target !== searchInput) {
+        suggestionsBox.innerHTML = '';
+      }
+    });
+
+    loadMoreBtn.addEventListener('click', () => loadMoreResults(true));
+
+    async function boot() {
+      try {
+        supabase = window.supabase && typeof window.supabase.createClient === 'function'
+          ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY)
+          : null;
+      } catch (e) {
+        console.error(e);
+        supabase = null;
+      }
+
+      renderAuth();
+      renderCollection();
+
+      if (!supabase) return;
+
+      const { data } = await supabase.auth.getUser();
+      currentUser = data.user || null;
+      renderAuth();
+      await loadCollection();
+
+      supabase.auth.onAuthStateChange(async (_event, session) => {
+        currentUser = session?.user || null;
+        renderAuth();
+        await loadCollection();
+      });
+    }
+
+    window.addEventListener('load', boot);
+  </script>
+</body>
+</html>
